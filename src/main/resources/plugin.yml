@@ -1,0 +1,6 @@
+name: TicketReset
+main: dev.ticketreset.TicketReset
+version: 1.0.0
+api-version: '1.21'
+depend: [AuthMe]
+description: Lets staff give players a temporary password from Discord.
