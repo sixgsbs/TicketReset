@@ -3,22 +3,51 @@ package dev.ticketreset;
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
 import net.dv8tion.jda.api.entities.Guild;
+import net.dv8tion.jda.api.entities.Member;
+import net.dv8tion.jda.api.events.interaction.command.SlashCommandInteractionEvent;
+import net.dv8tion.jda.api.hooks.ListenerAdapter;
+import net.dv8tion.jda.api.interactions.commands.OptionMapping;
 import net.dv8tion.jda.api.interactions.commands.OptionType;
 import net.dv8tion.jda.api.interactions.commands.build.Commands;
+import org.bukkit.Bukkit;
+import org.bukkit.OfflinePlayer;
+import org.bukkit.configuration.ConfigurationSection;
+import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
+import java.io.IOException;
 import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.regex.Pattern;
 
-public class TicketReset extends JavaPlugin {
+public final class TicketReset extends JavaPlugin implements Listener {
 
     private static final String ALPHABET = "abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    private static final Pattern NAME = Pattern.compile("^[A-Za-z0-9_]{3,16}$");
 
     private final SecureRandom random = new SecureRandom();
-    private final Set<Long> staffRoleIds = new HashSet<>();
     private JDA jda;
-    private DataStore store;
+    private final Set<Long> staffRoleIds = new HashSet<>();
+    private final Set<Long> ipRoleIds = new HashSet<>();
+
+    private File playersFile;
+    private File historyFile;
+    private YamlConfiguration players;
+    private YamlConfiguration history;
+    private boolean dirty;
 
     @Override
     public void onEnable() {
@@ -30,6 +59,7 @@ public class TicketReset extends JavaPlugin {
             for (String id : getConfig().getStringList("discord.staff-role-ids")) {
                 staffRoleIds.add(Long.parseLong(id.trim()));
             }
+            Long.parseLong(guildId.trim());
         } catch (NumberFormatException e) {
             getLogger().severe("guild-id and staff-role-ids in config.yml must be numbers. Disabling.");
             getServer().getPluginManager().disablePlugin(this);
@@ -40,26 +70,33 @@ public class TicketReset extends JavaPlugin {
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
-        if (token == null || token.isBlank() || token.startsWith("PUT_")) {
+        if (token.isBlank() || token.startsWith("PUT_")) {
             getLogger().severe("Set discord.token in config.yml. Disabling.");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
+        // optional: only these roles may use /ip and /alts (default: the staff roles)
+        for (String id : getConfig().getStringList("discord.ip-role-ids")) {
+            try {
+                ipRoleIds.add(Long.parseLong(id.trim()));
+            } catch (NumberFormatException ignored) {
+            }
+        }
 
-        store = new DataStore(this);
-        store.load();
-        getServer().getPluginManager().registerEvents(new PlayerListener(this, store), this);
+        getDataFolder().mkdirs();
+        playersFile = new File(getDataFolder(), "players.yml");
+        historyFile = new File(getDataFolder(), "history.yml");
+        players = YamlConfiguration.loadConfiguration(playersFile);
+        history = YamlConfiguration.loadConfiguration(historyFile);
+        getServer().getPluginManager().registerEvents(this, this);
+        getServer().getScheduler().runTaskTimer(this, this::saveIfDirty, 6000L, 6000L);
 
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
             try {
-                jda = JDABuilder.createLight(token)
-                        .addEventListeners(new DiscordListener(this, store))
-                        .build()
-                        .awaitReady();
-
-                Guild guild = jda.getGuildById(guildId);
+                jda = JDABuilder.createLight(token).addEventListeners(new ResetListener()).build().awaitReady();
+                Guild guild = jda.getGuildById(guildId.trim());
                 if (guild == null) {
-                    getLogger().severe("Bot is not in guild " + guildId + " (check discord.guild-id).");
+                    getLogger().severe("Bot is not in the guild " + guildId + ". Invite it first.");
                     return;
                 }
                 guild.updateCommands().addCommands(
@@ -73,67 +110,5 @@ public class TicketReset extends JavaPlugin {
                         Commands.slash("unban", "Unban a player from the Minecraft server")
                                 .addOption(OptionType.STRING, "player", "Minecraft username", true)
                                 .setGuildOnly(true),
-                        Commands.slash("mute", "Mute a player in Minecraft chat")
-                                .addOption(OptionType.STRING, "player", "Minecraft username", true)
-                                .addOption(OptionType.STRING, "reason", "Reason for the mute", false)
-                                .addOption(OptionType.STRING, "duration", "e.g. 30m, 2h, 7d (empty = permanent)", false)
-                                .setGuildOnly(true),
-                        Commands.slash("unmute", "Unmute a player")
-                                .addOption(OptionType.STRING, "player", "Minecraft username", true)
-                                .setGuildOnly(true),
-                        Commands.slash("history", "Show a player's punishment history")
-                                .addOption(OptionType.STRING, "player", "Minecraft username", true)
-                                .setGuildOnly(true),
-                        Commands.slash("alts", "Show accounts that share an IP with a player")
-                                .addOption(OptionType.STRING, "player", "Minecraft username", true)
-                                .setGuildOnly(true)
-                ).queue();
-                getLogger().info("Discord bot ready.");
-            } catch (Exception e) {
-                getLogger().severe("Could not start the Discord bot: " + e.getMessage());
-            }
-        });
-    }
-
-    @Override
-    public void onDisable() {
-        if (jda != null) jda.shutdown();
-        if (store != null) store.saveNow();
-    }
-
-    public boolean isStaffRole(long roleId) {
-        return staffRoleIds.contains(roleId);
-    }
-
-    public String randomPassword(int length) {
-        StringBuilder sb = new StringBuilder(length);
-        for (int i = 0; i < length; i++) sb.append(ALPHABET.charAt(random.nextInt(ALPHABET.length())));
-        return sb.toString();
-    }
-
-    public static String formatDuration(long ms) {
-        long s = Math.max(1, ms / 1000);
-        long d = s / 86400; s %= 86400;
-        long h = s / 3600; s %= 3600;
-        long m = s / 60; s %= 60;
-        StringBuilder sb = new StringBuilder();
-        if (d > 0) sb.append(d).append("d ");
-        if (h > 0) sb.append(h).append("h ");
-        if (m > 0) sb.append(m).append("m ");
-        if (sb.isEmpty()) sb.append(s).append("s");
-        return sb.toString().trim();
-    }
-
-    public static long parseDuration(String text) {
-        var m = java.util.regex.Pattern.compile("^(\\d{1,6})([smhdw])$").matcher(text.trim().toLowerCase());
-        if (!m.matches()) return -1;
-        long n = Long.parseLong(m.group(1));
-        return switch (m.group(2)) {
-            case "s" -> n * 1000L;
-            case "m" -> n * 60_000L;
-            case "h" -> n * 3_600_000L;
-            case "d" -> n * 86_400_000L;
-            default -> n * 604_800_000L;
-        };
-    }
-}
+                        Commands.slash("history", "Join info and punishment history of a player")
+                                .addOption(OptionType.STRING, "player",
